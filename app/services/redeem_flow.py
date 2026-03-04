@@ -339,8 +339,33 @@ class RedeemFlowService:
                         )
                         db_session.add(redemption_record)
                         
-                        # 同步最新成员数
-                        await self.team_service.sync_team_info(team_id_final, db_session)
+                    # 同步最新成员数并校验邀请是否生效
+                    sync_res = await self.team_service.sync_team_info(team_id_final, db_session)
+                    
+                    # 强校验：如果同步结果中没有当前邮箱，说明是“虚假成功”
+                    member_emails = sync_res.get("member_emails", [])
+                    if email.lower() not in [m.lower() for m in member_emails]:
+                        logger.error(f"检测到“虚假成功”: Team {team_id_final} 接口返回邀请成功，但同步成员列表未见该邮箱 {email}")
+                        
+                        # 手动标记错误并累加计数
+                        async with db_session.begin():
+                            stmt = select(Team).where(Team.id == team_id_final).with_for_update()
+                            res = await db_session.execute(stmt)
+                            target_team = res.scalar_one_or_none()
+                            if target_team:
+                                target_team.error_count = (target_team.error_count or 0) + 1
+                                if target_team.error_count >= 3:
+                                    logger.error(f"Team {target_team.id} 连续虚假成功/错误 {target_team.error_count} 次，标记为 error")
+                                    target_team.status = "error"
+                                await db_session.commit()
+                        
+                        # 触发回滚并进入重试逻辑
+                        await self._rollback_redemption(db_session, code, team_id_final)
+                        last_error = "邀请发送后校验失败（账号可能异常）"
+                        if attempt < max_retries - 1:
+                            current_target_team_id = None
+                            continue
+                        return {"success": False, "error": last_error}
                     
                     logger.info(f"兑换成功: {email} 加入 Team {team_id_final}")
 

@@ -916,12 +916,18 @@ class TeamService:
                 identifier=team.email
             )
 
-            current_members = 0
+            all_member_emails = set()
             if members_result["success"]:
                 current_members += members_result["total"]
+                for m in members_result.get("members", []):
+                    if m.get("email"):
+                        all_member_emails.add(m["email"].lower())
             
             if invites_result["success"]:
                 current_members += invites_result["total"]
+                for inv in invites_result.get("items", []):
+                    if inv.get("email_address"):
+                        all_member_emails.add(inv["email_address"].lower())
             else:
                 # 检查是否封号或 Token 失效
                 if await self._handle_api_error(invites_result, team, db_session):
@@ -985,6 +991,7 @@ class TeamService:
             return {
                 "success": True,
                 "message": f"同步成功,当前成员数: {current_members}",
+                "member_emails": list(all_member_emails),
                 "error": None
             }
 
@@ -1386,8 +1393,19 @@ class TeamService:
                     "error": f"发送邀请失败: {invite_result['error']}"
                 }
 
-            # 5. 更新成员数 (不再手动 +1，同步最新数据)
-            await self.sync_team_info(team_id, db_session)
+            # 5. 更新成员数并二次校验邀请是否真的生效 (防止接口返回 200 但实际未加入)
+            sync_res = await self.sync_team_info(team_id, db_session)
+            member_emails = sync_res.get("member_emails", [])
+            
+            if email.lower() not in [m.lower() for m in member_emails]:
+                logger.error(f"检测到“虚假成功”: Team {team_id} 发送邀请返回成功，但成员列表中未见该邮箱 {email}")
+                # 标记错误
+                await self._handle_api_error({"success": False, "error": "邀请发送成功但同步列表未见成员", "error_code": "ghost_success"}, team, db_session)
+                return {
+                    "success": False,
+                    "message": None,
+                    "error": "邀请发送成功但同步成员列表校验失败，该 Team 账号可能存在异常。"
+                }
 
             await db_session.commit()
 
